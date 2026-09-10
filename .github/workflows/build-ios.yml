@@ -77,7 +77,7 @@ jobs:
           xcrun --sdk iphoneos swiftc \
             -parse-as-library \
             -sdk "$SDK" \
-            -target arm64-apple-ios13.0 \
+            -target arm64-apple-ios18.0 \
             -import-objc-header "$PWD/output/ios/liboflux.h" \
             "$PWD/ios/App.swift" \
             "$PWD/output/ios/liboflux.a" \
