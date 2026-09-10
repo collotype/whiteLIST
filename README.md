@@ -11,6 +11,8 @@
 
 Подпись должна сохранить entitlement `com.apple.developer.networking.networkextension` со значением `packet-tunnel-provider`. Без разрешённого Apple provisioning profile iOS не запустит VPN-расширение.
 
+Bundle ID оставлен `com.collotype.openflux`, поэтому сборка заменяет прежнюю версию OpenFlux и не занимает дополнительный слот бесплатного профиля. Не включайте в Sideloadly опцию удаления app extensions: в расширении находится сам VPN-туннель.
+
 ## Использование
 
 При первом запуске откройте **Настройка** и один раз укажите:

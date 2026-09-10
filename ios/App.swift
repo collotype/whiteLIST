@@ -42,7 +42,7 @@ final class ViewController: UIViewController {
     private var connectAfterSave = false
 
     private var tunnelBundleIdentifier: String {
-        (Bundle.main.bundleIdentifier ?? "com.collotype.whitelist") + ".tunnel"
+        (Bundle.main.bundleIdentifier ?? "com.collotype.openflux") + ".tunnel"
     }
 
     private let statusDot = UIView()

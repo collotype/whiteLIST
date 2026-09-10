@@ -9,7 +9,7 @@
     <key>CFBundleExecutable</key>
     <string>whiteLIST</string>
     <key>CFBundleIdentifier</key>
-    <string>com.collotype.whitelist</string>
+    <string>com.collotype.openflux</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
