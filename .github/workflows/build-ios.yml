@@ -1,0 +1,112 @@
+name: Build OpenFlux iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Verify OpenFlux sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f go.mod
+          test -f go.sum
+          test -f main.go
+          test -f build_ios.sh
+          test -f ios_export.go
+          test -f ios/App.swift
+          test -f ios/Info.plist
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Tool versions
+        run: |
+          go version
+          xcodebuild -version
+          swiftc --version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build OpenFlux Go library
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x build_ios.sh
+          ./build_ios.sh
+          test -s output/ios/liboflux.a
+          test -s output/ios/liboflux.h
+
+      - name: Verify iOS bridge symbols
+        shell: bash
+        run: |
+          set -euxo pipefail
+          grep -q "OFStartYandex" output/ios/liboflux.h
+          grep -q "OFStartMax" output/ios/liboflux.h
+          grep -q "OFStop" output/ios/liboflux.h
+          grep -q "OFStatusJSON" output/ios/liboflux.h
+          grep -q "OFTestTunnel" output/ios/liboflux.h
+
+      - name: Compile unsigned iOS app
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          APP="$PWD/build/Payload/OpenFlux.app"
+
+          rm -rf "$PWD/build"
+          mkdir -p "$APP"
+          cp ios/Info.plist "$APP/Info.plist"
+
+          xcrun --sdk iphoneos swiftc \
+            -parse-as-library \
+            -sdk "$SDK" \
+            -target arm64-apple-ios13.0 \
+            -import-objc-header "$PWD/output/ios/liboflux.h" \
+            "$PWD/ios/App.swift" \
+            "$PWD/output/ios/liboflux.a" \
+            -framework UIKit \
+            -framework Foundation \
+            -framework Security \
+            -framework Network \
+            -Xlinker -no_warn_duplicate_libraries \
+            -o "$APP/OpenFlux"
+
+          chmod +x "$APP/OpenFlux"
+          rm -rf "$APP/_CodeSignature" || true
+          rm -f "$APP/embedded.mobileprovision" || true
+
+          file "$APP/OpenFlux"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd build
+          /usr/bin/zip -qry OpenFlux-unsigned.ipa Payload
+          shasum -a 256 OpenFlux-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenFlux-iOS
+          path: build/OpenFlux-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
