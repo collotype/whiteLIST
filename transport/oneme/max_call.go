@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -16,17 +15,39 @@ var (
 	useICEInjection = true
 )
 
-func (h *CallHandler) SetOnConnected(cb func())    { h.onConnected = cb }
+func (h *CallHandler) SetOnConnected(cb func()) {
+	h.onConnected = cb
+	if h.connected.Load() && cb != nil {
+		cb()
+	}
+}
 func (h *CallHandler) SetDCInbound(cb func([]byte)) { h.dcInbound = cb }
 
-func (h *CallHandler) Send(data []byte) {
-	if useICEInjection {
-		h.injectICE(data)
-	} else {
-		if h.dc != nil {
-			h.dc.Send(data)
-		}
+func (h *CallHandler) deliver(data []byte) {
+	if h.dcInbound != nil {
+		h.dcInbound(data)
 	}
+}
+
+func (h *CallHandler) IsConnected() bool { return h.connected.Load() }
+
+func (h *CallHandler) markConnected() {
+	if h.connected.CompareAndSwap(false, true) && h.onConnected != nil {
+		h.onConnected()
+	}
+}
+
+func (h *CallHandler) Send(data []byte) error {
+	if !h.running.Load() || !h.connected.Load() {
+		return fmt.Errorf("MAX call is not connected")
+	}
+	if useICEInjection {
+		return h.injectICE(data)
+	}
+	if h.dc == nil {
+		return fmt.Errorf("MAX data channel is not open")
+	}
+	return h.dc.Send(data)
 }
 
 func (h *CallHandler) readLoop() {
@@ -34,6 +55,7 @@ func (h *CallHandler) readLoop() {
 	for {
 		_, message, err := h.conn.ReadMessage()
 		if err != nil {
+			h.connected.Store(false)
 			logError("[%s] Signaling disconnected: %v", h.tag, err)
 			h.signalReconnect()
 			return
@@ -43,6 +65,7 @@ func (h *CallHandler) readLoop() {
 		if strings.Contains(text, "accepted-call") {
 			fmt.Println("call accepted")
 			h.callAccepted = true
+			h.markConnected()
 			continue
 		}
 
@@ -83,8 +106,7 @@ func (h *CallHandler) signalReconnect() {
 		default:
 		}
 	} else {
-		logError("[%s] Receiver connection died, exiting", h.tag)
-		os.Exit(1)
+		logError("[%s] Receiver connection died", h.tag)
 	}
 }
 
@@ -101,6 +123,7 @@ func (h *CallHandler) sendAcceptCall() {
 	msg := fmt.Sprintf(`{"command":"accept-call","sequence":%d,"mediaSettings":{"isAudioEnabled":true,"isVideoEnabled":false,"isScreenSharingEnabled":false,"isFastScreenSharingEnabled":false,"isAudioSharingEnabled":false,"isAnimojiEnabled":false}}`, h.seq)
 	h.seq++
 	h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
+	h.markConnected()
 	logInfo("[%s] Accept-call sent", h.tag)
 }
 
@@ -171,7 +194,7 @@ func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 		h.dc = dc
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			logInfo("[%s] RECV: %s", h.tag, string(msg.Data))
-			h.dcInbound(msg.Data)
+			h.deliver(msg.Data)
 		})
 	})
 
@@ -195,7 +218,7 @@ func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 	//}
 	dc.OnOpen(func() { logInfo("[%s] DC opened", h.tag) })
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		h.dcInbound(msg.Data)
+		h.deliver(msg.Data)
 	})
 }
 
@@ -214,11 +237,11 @@ func (h *CallHandler) sendSDP(sdp string, sdpType string) {
 	//h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
 }
 
-func (h *CallHandler) injectICE(payload []byte) {
+func (h *CallHandler) injectICE(payload []byte) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.conn == nil {
-		return
+		return fmt.Errorf("MAX signaling socket is closed")
 	}
 	type ice struct {
 		Candidate string `json:"candidate"`
@@ -228,7 +251,7 @@ func (h *CallHandler) injectICE(payload []byte) {
 	msg := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"candidate":{"candidate":%s}},"participantType":"USER"}`,
 		h.seq, h.localID, string(escaped))
 	h.seq++
-	h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
+	return h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
 }
 
 func (h *CallHandler) sendICE(candidateJSON string) {
@@ -330,7 +353,8 @@ func (h *CallHandler) handleSDP(sdpType string, sdpStr string) {
 }
 
 func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
-	h := &CallHandler{tag: "CALLER", role: "caller"}
+	h := &CallHandler{tag: "CALLER", role: "caller", doneCh: make(chan struct{})}
+	h.running.Store(true)
 	h.seq = 1
 	h.reconnectCh = make(chan struct{}, 1)
 	h.msgHandler = func(text string) {
@@ -396,7 +420,7 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			if useICEInjection {
 				candidateStr, _ := c["candidate"].(string)
 				decode, _ := base64.StdEncoding.DecodeString(candidateStr)
-				h.dcInbound(decode)
+				h.deliver(decode)
 			} else {
 				h.bufferOrAddICE(c)
 			}
@@ -407,7 +431,7 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 
 	// Connect with auto-reconnect loop
 	go func() {
-		for {
+		for h.running.Load() {
 			h.mu.Lock()
 			h.callAccepted = false
 			h.acceptSent = false
@@ -421,17 +445,36 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			h.dc = nil
 			h.mu.Unlock()
 
-			resp, _ := client.invoke(78, map[string]interface{}{
+			resp, err := client.invoke(78, map[string]interface{}{
 				"conversationId": genUUID(),
 				"calleeIds":      []int64{calleeID},
 				"internalParams": fmt.Sprintf(`{"deviceId":"%s","sdkVersion":"2.8.9","clientAppKey":"CNHIJPLGDIHBABABA","platform":"WEB","protocolVersion":5,"domainId":"","capabilities":"2A03F"}`, client.deviceID),
 				"isVideo":        false,
 			})
+			if err != nil || resp == nil {
+				logError("[CALLER] Create call failed: %v", err)
+				select {
+				case <-time.After(time.Second):
+					continue
+				case <-h.doneCh:
+					return
+				}
+			}
 			var payload map[string]interface{}
-			json.Unmarshal(resp.Payload, &payload)
+			if err := json.Unmarshal(resp.Payload, &payload); err != nil {
+				logError("[CALLER] Invalid call response: %v", err)
+				continue
+			}
 			paramsStr, _ := payload["internalCallerParams"].(string)
+			if paramsStr == "" {
+				logError("[CALLER] Missing call parameters")
+				continue
+			}
 			var params InternalCallerParams
-			json.Unmarshal([]byte(paramsStr), &params)
+			if err := json.Unmarshal([]byte(paramsStr), &params); err != nil || params.Endpoint == "" {
+				logError("[CALLER] Invalid call parameters: %v", err)
+				continue
+			}
 
 			endpoint := params.Endpoint + "&platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME&tgt=start"
 			conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
@@ -446,9 +489,17 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			go h.readLoop()
 
 			// Wait for disconnect signal
-			<-h.reconnectCh
+			select {
+			case <-h.reconnectCh:
+			case <-h.doneCh:
+				return
+			}
 			logInfo("[CALLER] Reconnecting in 1s...")
-			time.Sleep(1 * time.Second)
+			select {
+			case <-time.After(time.Second):
+			case <-h.doneCh:
+				return
+			}
 		}
 	}()
 
@@ -456,7 +507,8 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 }
 
 func startIncomingListener(client *MaxClient) *CallHandler {
-	h := &CallHandler{tag: "RECEIVER", role: "receiver"}
+	h := &CallHandler{tag: "RECEIVER", role: "receiver", doneCh: make(chan struct{})}
+	h.running.Store(true)
 	h.seq = 1
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
@@ -499,7 +551,7 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 			if useICEInjection {
 				candidateStr, _ := c["candidate"].(string)
 				decode, _ := base64.StdEncoding.DecodeString(candidateStr)
-				h.dcInbound(decode)
+				h.deliver(decode)
 			} else {
 				h.bufferOrAddICE(c)
 			}
@@ -541,4 +593,22 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 	})
 	logInfo("[RECEIVER] Waiting for calls...")
 	return h
+}
+
+func (h *CallHandler) Close() {
+	if !h.running.CompareAndSwap(true, false) {
+		return
+	}
+	h.connected.Store(false)
+	close(h.doneCh)
+	h.mu.Lock()
+	if h.conn != nil {
+		_ = h.conn.Close()
+		h.conn = nil
+	}
+	if h.pc != nil {
+		_ = h.pc.Close()
+		h.pc = nil
+	}
+	h.mu.Unlock()
 }

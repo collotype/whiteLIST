@@ -66,6 +66,10 @@ func (c *MaxClient) invoke(opcode int, payload map[string]interface{}) (*MaxPack
 	c.pending.Store(seq, ch)
 	defer c.pending.Delete(seq)
 	c.mu.Lock()
+	if c.conn == nil {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("MAX websocket is not connected")
+	}
 	err := c.conn.WriteMessage(websocket.TextMessage, data)
 	c.mu.Unlock()
 	if err != nil {
@@ -80,14 +84,16 @@ func (c *MaxClient) invoke(opcode int, payload map[string]interface{}) (*MaxPack
 }
 
 func (c *MaxClient) LoginByToken(token string) error {
-	c.invoke(6, map[string]interface{}{
+	if _, err := c.invoke(6, map[string]interface{}{
 		"userAgent": map[string]interface{}{
 			"deviceType": "WEB", "locale": "ru_RU", "osVersion": "macOS",
 			"deviceName": "vkmax Go", "appVersion": "25.9.15",
 			"screen": "956x1470 2.0x", "timezone": "Asia/Vladivostok",
 		},
 		"deviceId": c.deviceID,
-	})
+	}); err != nil {
+		return fmt.Errorf("MAX session init: %w", err)
+	}
 	resp, err := c.invoke(19, map[string]interface{}{
 		"interactive": true, "token": token, "chatsSync": 0,
 		"contactsSync": 0, "presenceSync": 0, "draftsSync": 0, "chatsCount": 40,
@@ -160,4 +166,17 @@ func (c *MaxClient) keepalive() {
 			}
 		}
 	}
+}
+
+func (c *MaxClient) Close() {
+	c.closeOnce.Do(func() {
+		close(c.keepaliveStop)
+		c.mu.Lock()
+		c.loggedIn = false
+		if c.conn != nil {
+			_ = c.conn.Close()
+			c.conn = nil
+		}
+		c.mu.Unlock()
+	})
 }

@@ -5,41 +5,29 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>ru</string>
     <key>CFBundleDisplayName</key>
-    <string>whiteLIST</string>
+    <string>whiteLIST Tunnel</string>
     <key>CFBundleExecutable</key>
-    <string>whiteLIST</string>
+    <string>OpenFluxTunnel</string>
     <key>CFBundleIdentifier</key>
-    <string>com.collotype.whitelist</string>
+    <string>com.collotype.whitelist.tunnel</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>whiteLIST</string>
+    <string>OpenFluxTunnel</string>
     <key>CFBundlePackageType</key>
-    <string>APPL</string>
+    <string>XPC!</string>
     <key>CFBundleShortVersionString</key>
     <string>2.0</string>
     <key>CFBundleVersion</key>
     <string>2</string>
-    <key>ITSAppUsesNonExemptEncryption</key>
-    <false/>
-    <key>LSRequiresIPhoneOS</key>
-    <true/>
     <key>MinimumOSVersion</key>
     <string>15.0</string>
-    <key>UIDeviceFamily</key>
-    <array>
-        <integer>1</integer>
-        <integer>2</integer>
-    </array>
-    <key>UILaunchScreen</key>
-    <dict/>
-    <key>UIRequiredDeviceCapabilities</key>
-    <array>
-        <string>arm64</string>
-    </array>
-    <key>UISupportedInterfaceOrientations</key>
-    <array>
-        <string>UIInterfaceOrientationPortrait</string>
-    </array>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionPointIdentifier</key>
+        <string>com.apple.networkextension.packet-tunnel</string>
+        <key>NSExtensionPrincipalClass</key>
+        <string>OpenFluxTunnel.PacketTunnelProvider</string>
+    </dict>
 </dict>
 </plist>

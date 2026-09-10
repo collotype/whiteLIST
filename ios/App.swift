@@ -1,6 +1,5 @@
 import UIKit
-import Foundation
-import Darwin
+import NetworkExtension
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -18,459 +17,448 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 }
 
+private struct TunnelStatus: Decodable {
+    let running: Bool
+    let transport: String
+    let connected: Bool
+    let lastError: String
+    let bytesSent: UInt64
+    let bytesReceived: UInt64
+    let packetsSent: UInt64
+    let packetsRecv: UInt64
+    let droppedRecv: UInt64
+    let reconnects: UInt64
+    let uptimeMs: Int64
+}
+
 final class ViewController: UIViewController {
-    private let defaults = UserDefaults.standard
-    private var outputPipe: Pipe?
-    private var statusTimer: Timer?
+    private var manager: NETunnelProviderManager?
+    private var observer: NSObjectProtocol?
+    private var timer: Timer?
+    private var latestStatus: TunnelStatus?
+    private var internetVerified = false
+    private var probeInFlight = false
+    private var lastProbe = Date.distantPast
+    private var connectAfterSave = false
 
-    private let transportControl: UISegmentedControl = {
-        let c = UISegmentedControl(items: ["Yandex", "MAX"])
-        c.translatesAutoresizingMaskIntoConstraints = false
-        c.selectedSegmentIndex = 0
-        return c
-    }()
+    private var tunnelBundleIdentifier: String {
+        (Bundle.main.bundleIdentifier ?? "com.collotype.whitelist") + ".tunnel"
+    }
 
-    private let urlField = ViewController.makeField(
-        placeholder: "Yandex Docs URL",
-        keyboard: .URL,
-        secure: false
-    )
-
-    private let maxTokenField = ViewController.makeField(
-        placeholder: "MAX token",
-        keyboard: .default,
-        secure: true
-    )
-
-    private let maxUIDField = ViewController.makeField(
-        placeholder: "MAX UID",
-        keyboard: .numberPad,
-        secure: false
-    )
-
-    private let connectButton: UIButton = {
-        let b = UIButton(type: .system)
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.configuration = .filled()
-        b.setTitle("Connect", for: .normal)
-        return b
-    }()
-
-    private let disconnectButton: UIButton = {
-        let b = UIButton(type: .system)
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.configuration = .bordered()
-        b.setTitle("Disconnect", for: .normal)
-        b.isEnabled = false
-        return b
-    }()
-
-    private let testButton: UIButton = {
-        let b = UIButton(type: .system)
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.configuration = .bordered()
-        b.setTitle("Test tunnel", for: .normal)
-        b.isEnabled = false
-        return b
-    }()
-
-    private let statusLabel: UILabel = {
-        let l = UILabel()
-        l.translatesAutoresizingMaskIntoConstraints = false
-        l.numberOfLines = 0
-        l.font = .systemFont(ofSize: 15, weight: .semibold)
-        l.text = "● Stopped"
-        return l
-    }()
-
-    private let statsLabel: UILabel = {
-        let l = UILabel()
-        l.translatesAutoresizingMaskIntoConstraints = false
-        l.numberOfLines = 0
-        l.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        l.text = "SOCKS5: 127.0.0.1:1080"
-        return l
-    }()
-
-    private let noteLabel: UILabel = {
-        let l = UILabel()
-        l.translatesAutoresizingMaskIntoConstraints = false
-        l.numberOfLines = 0
-        l.font = .systemFont(ofSize: 12)
-        l.textColor = .secondaryLabel
-        l.text = "This build runs the original OpenFlux transport and a local SOCKS5 proxy. It is not a system-wide iOS VPN. Keep the app open while testing."
-        return l
-    }()
-
-    private let logView: UITextView = {
-        let v = UITextView()
-        v.translatesAutoresizingMaskIntoConstraints = false
-        v.isEditable = false
-        v.isSelectable = true
-        v.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        v.layer.borderWidth = 0.5
-        v.layer.cornerRadius = 8
-        return v
-    }()
-
-    private let clearLogButton: UIButton = {
-        let b = UIButton(type: .system)
-        b.setTitle("Clear log", for: .normal)
-        return b
-    }()
+    private let statusDot = UIView()
+    private let statusLabel = UILabel()
+    private let detailLabel = UILabel()
+    private let statsLabel = UILabel()
+    private let connectButton = UIButton(type: .system)
+    private let settingsButton = UIButton(type: .system)
+    private let settingsStack = UIStackView()
+    private let transportControl = UISegmentedControl(items: ["Yandex", "MAX"])
+    private let urlField = ViewController.field("Ссылка на Yandex Docs", keyboard: .URL)
+    private let tokenField = ViewController.field("MAX token", secure: true)
+    private let uidField = ViewController.field("UID выходного узла", keyboard: .numberPad)
+    private let saveButton = UIButton(type: .system)
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "OpenFlux"
-        view.backgroundColor = .systemBackground
+        title = "whiteLIST"
+        view.backgroundColor = UIColor(red: 0.055, green: 0.047, blue: 0.082, alpha: 1)
+        navigationController?.navigationBar.prefersLargeTitles = true
+        navigationController?.navigationBar.titleTextAttributes = [.foregroundColor: UIColor.white]
+        navigationController?.navigationBar.largeTitleTextAttributes = [.foregroundColor: UIColor.white]
 
-        installOutputCapture()
         buildUI()
-        loadSettings()
-        updateTransportFields()
-        startStatusTimer()
-
-        appendLog("[iOS] OpenFlux wrapper ready")
-        appendLog("[iOS] SOCKS5 endpoint: 127.0.0.1:1080")
+        loadManager()
+        observer = NotificationCenter.default.addObserver(
+            forName: .NEVPNStatusDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.internetVerified = false
+            self?.refresh()
+        }
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
     }
 
     deinit {
-        statusTimer?.invalidate()
-        outputPipe?.fileHandleForReading.readabilityHandler = nil
+        timer?.invalidate()
+        if let observer { NotificationCenter.default.removeObserver(observer) }
     }
 
-    private static func makeField(
-        placeholder: String,
-        keyboard: UIKeyboardType,
-        secure: Bool
+    private static func field(
+        _ placeholder: String,
+        keyboard: UIKeyboardType = .default,
+        secure: Bool = false
     ) -> UITextField {
-        let f = UITextField()
-        f.translatesAutoresizingMaskIntoConstraints = false
-        f.borderStyle = .roundedRect
-        f.placeholder = placeholder
-        f.keyboardType = keyboard
-        f.autocapitalizationType = .none
-        f.autocorrectionType = .no
-        f.isSecureTextEntry = secure
-        f.clearButtonMode = .whileEditing
-        return f
+        let field = UITextField()
+        field.placeholder = placeholder
+        field.keyboardType = keyboard
+        field.isSecureTextEntry = secure
+        field.autocapitalizationType = .none
+        field.autocorrectionType = .no
+        field.textColor = .white
+        field.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        field.layer.cornerRadius = 12
+        field.setLeftPadding(12)
+        field.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        return field
     }
 
     private func buildUI() {
-        let scroll = UIScrollView()
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(scroll)
-
-        let content = UIStackView()
-        content.translatesAutoresizingMaskIntoConstraints = false
-        content.axis = .vertical
-        content.spacing = 12
-        scroll.addSubview(content)
-
-        let buttons = UIStackView(arrangedSubviews: [connectButton, disconnectButton])
-        buttons.axis = .horizontal
-        buttons.spacing = 10
-        buttons.distribution = .fillEqually
-
-        let logHeader = UIStackView()
-        logHeader.axis = .horizontal
-        let logTitle = UILabel()
-        logTitle.text = "Live log"
-        logTitle.font = .systemFont(ofSize: 14, weight: .semibold)
-        logHeader.addArrangedSubview(logTitle)
-        logHeader.addArrangedSubview(UIView())
-        logHeader.addArrangedSubview(clearLogButton)
-
-        content.addArrangedSubview(transportControl)
-        content.addArrangedSubview(urlField)
-        content.addArrangedSubview(maxTokenField)
-        content.addArrangedSubview(maxUIDField)
-        content.addArrangedSubview(buttons)
-        content.addArrangedSubview(testButton)
-        content.addArrangedSubview(statusLabel)
-        content.addArrangedSubview(statsLabel)
-        content.addArrangedSubview(noteLabel)
-        content.addArrangedSubview(logHeader)
-        content.addArrangedSubview(logView)
-
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
+        statusDot.layer.cornerRadius = 6
+        statusDot.backgroundColor = .systemGray
         NSLayoutConstraint.activate([
-            scroll.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
-
-            content.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 16),
-            content.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -16),
-            content.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 16),
-            content.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -16),
-            content.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -32),
-
-            logView.heightAnchor.constraint(equalToConstant: 320)
+            statusDot.widthAnchor.constraint(equalToConstant: 12),
+            statusDot.heightAnchor.constraint(equalToConstant: 12)
         ])
 
-        transportControl.addTarget(self, action: #selector(transportChanged), for: .valueChanged)
+        statusLabel.text = "Загрузка…"
+        statusLabel.textColor = .white
+        statusLabel.font = .systemFont(ofSize: 22, weight: .bold)
+
+        detailLabel.textColor = UIColor.white.withAlphaComponent(0.62)
+        detailLabel.font = .systemFont(ofSize: 14)
+        detailLabel.numberOfLines = 0
+
+        statsLabel.textColor = UIColor.white.withAlphaComponent(0.75)
+        statsLabel.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+        statsLabel.numberOfLines = 0
+        statsLabel.text = "↑ 0 Б   ↓ 0 Б"
+
+        connectButton.configuration = .filled()
+        connectButton.configuration?.cornerStyle = .large
+        connectButton.configuration?.baseBackgroundColor = UIColor(red: 0.64, green: 0.42, blue: 0.95, alpha: 1)
+        connectButton.configuration?.contentInsets = .init(top: 16, leading: 24, bottom: 16, trailing: 24)
+        connectButton.titleLabel?.font = .systemFont(ofSize: 18, weight: .bold)
+        connectButton.setTitle("Подключить", for: .normal)
         connectButton.addTarget(self, action: #selector(connectTapped), for: .touchUpInside)
-        disconnectButton.addTarget(self, action: #selector(disconnectTapped), for: .touchUpInside)
-        testButton.addTarget(self, action: #selector(testTapped), for: .touchUpInside)
-        clearLogButton.addTarget(self, action: #selector(clearLogTapped), for: .touchUpInside)
+
+        settingsButton.setTitle("Настройка", for: .normal)
+        settingsButton.tintColor = UIColor(red: 0.76, green: 0.63, blue: 1, alpha: 1)
+        settingsButton.addTarget(self, action: #selector(toggleSettings), for: .touchUpInside)
+
+        let statusRow = UIStackView(arrangedSubviews: [statusDot, statusLabel, UIView()])
+        statusRow.axis = .horizontal
+        statusRow.alignment = .center
+        statusRow.spacing = 10
+
+        let card = UIStackView(arrangedSubviews: [statusRow, detailLabel, statsLabel])
+        card.axis = .vertical
+        card.spacing = 10
+        card.isLayoutMarginsRelativeArrangement = true
+        card.layoutMargins = .init(top: 20, left: 20, bottom: 20, right: 20)
+        card.backgroundColor = UIColor.white.withAlphaComponent(0.07)
+        card.layer.cornerRadius = 20
+
+        transportControl.selectedSegmentIndex = 0
+        transportControl.selectedSegmentTintColor = UIColor(red: 0.64, green: 0.42, blue: 0.95, alpha: 1)
+        transportControl.setTitleTextAttributes([.foregroundColor: UIColor.white], for: .normal)
+        transportControl.addTarget(self, action: #selector(transportChanged), for: .valueChanged)
+
+        saveButton.configuration = .bordered()
+        saveButton.configuration?.cornerStyle = .large
+        saveButton.configuration?.baseForegroundColor = UIColor(red: 0.76, green: 0.63, blue: 1, alpha: 1)
+        saveButton.setTitle("Сохранить", for: .normal)
+        saveButton.addTarget(self, action: #selector(saveTapped), for: .touchUpInside)
+
+        settingsStack.axis = .vertical
+        settingsStack.spacing = 10
+        settingsStack.addArrangedSubview(transportControl)
+        settingsStack.addArrangedSubview(urlField)
+        settingsStack.addArrangedSubview(tokenField)
+        settingsStack.addArrangedSubview(uidField)
+        settingsStack.addArrangedSubview(saveButton)
+        settingsStack.isHidden = true
+
+        let note = UILabel()
+        note.text = "Параметры сохраняются в конфигурации VPN — повторно вводить их при каждом запуске не нужно."
+        note.textColor = UIColor.white.withAlphaComponent(0.42)
+        note.font = .systemFont(ofSize: 12)
+        note.numberOfLines = 0
+
+        let stack = UIStackView(arrangedSubviews: [card, connectButton, settingsButton, settingsStack, note])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .vertical
+        stack.spacing = 16
+        view.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            stack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
+            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 24)
+        ])
+
+        let tap = UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard))
+        tap.cancelsTouchesInView = false
+        view.addGestureRecognizer(tap)
+        transportChanged()
     }
 
-    private func installOutputCapture() {
-        let pipe = Pipe()
-        outputPipe = pipe
-        let fd = pipe.fileHandleForWriting.fileDescriptor
-
-        dup2(fd, STDOUT_FILENO)
-        dup2(fd, STDERR_FILENO)
-
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+    private func loadManager() {
+        NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, error in
             DispatchQueue.main.async {
-                self?.appendLog(text, timestamp: false)
+                guard let self else { return }
+                if let error {
+                    self.showError("Не удалось загрузить VPN: \(error.localizedDescription)")
+                    return
+                }
+                self.manager = managers?.first(where: {
+                    ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == self.tunnelBundleIdentifier
+                }) ?? NETunnelProviderManager()
+                self.loadSavedConfiguration()
+                self.refresh()
             }
         }
     }
 
-    @objc private func transportChanged() {
-        updateTransportFields()
-        saveSettings()
-    }
-
-    private func updateTransportFields() {
-        let isYandex = transportControl.selectedSegmentIndex == 0
-        urlField.isHidden = !isYandex
-        maxTokenField.isHidden = isYandex
-        maxUIDField.isHidden = isYandex
+    private func loadSavedConfiguration() {
+        guard let configuration = manager?.protocolConfiguration as? NETunnelProviderProtocol,
+              let values = configuration.providerConfiguration else {
+            settingsStack.isHidden = false
+            detailLabel.text = "Заполните настройку один раз"
+            return
+        }
+        let kind = values["transport"] as? String ?? "yandex"
+        transportControl.selectedSegmentIndex = kind == "max" ? 1 : 0
+        urlField.text = values["url"] as? String ?? ""
+        tokenField.text = values["token"] as? String ?? ""
+        uidField.text = values["uid"] as? String ?? ""
+        transportChanged()
     }
 
     @objc private func connectTapped() {
+        guard let manager else { return }
+        switch manager.connection.status {
+        case .connected, .connecting, .reasserting:
+            manager.connection.stopVPNTunnel()
+        case .disconnecting:
+            break
+        case .disconnected, .invalid:
+            guard hasValidSavedConfiguration else {
+                connectAfterSave = true
+                settingsStack.isHidden = false
+                showError("Сначала сохраните параметры подключения")
+                return
+            }
+            do {
+                internetVerified = false
+                try manager.connection.startVPNTunnel()
+            } catch {
+                showError("VPN не запустился: \(error.localizedDescription)")
+            }
+        @unknown default:
+            break
+        }
+        refresh()
+    }
+
+    private var hasValidSavedConfiguration: Bool {
+        guard let configuration = manager?.protocolConfiguration as? NETunnelProviderProtocol,
+              let values = configuration.providerConfiguration,
+              let kind = values["transport"] as? String else { return false }
+        if kind == "yandex" {
+            return ((values["url"] as? String) ?? "").hasPrefix("https://")
+        }
+        return !((values["token"] as? String) ?? "").isEmpty && Int64((values["uid"] as? String) ?? "") != nil
+    }
+
+    @objc private func saveTapped() {
         view.endEditing(true)
-        saveSettings()
+        guard let manager else { return }
 
-        connectButton.isEnabled = false
-        transportControl.isEnabled = false
-        urlField.isEnabled = false
-        maxTokenField.isEnabled = false
-        maxUIDField.isEnabled = false
-
-        statusLabel.text = "● Starting…"
-        appendLog("[iOS] ===== CONNECT =====")
-
-        let isYandex = transportControl.selectedSegmentIndex == 0
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            let result: Int32
-
-            if isYandex {
-                let url = self.urlField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if url.isEmpty {
-                    DispatchQueue.main.async {
-                        self.finishStartFailure("Enter Yandex Docs URL")
-                    }
-                    return
-                }
-                result = url.withCString { ptr in
-                    OFStartYandex(UnsafeMutablePointer(mutating: ptr))
-                }
-            } else {
-                let token = self.maxTokenField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                let uidText = self.maxUIDField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                guard !token.isEmpty, let uid = Int64(uidText), uid > 0 else {
-                    DispatchQueue.main.async {
-                        self.finishStartFailure("Enter MAX token and numeric UID")
-                    }
-                    return
-                }
-                result = token.withCString { ptr in
-                    OFStartMax(UnsafeMutablePointer(mutating: ptr), uid)
-                }
-            }
-
-            DispatchQueue.main.async {
-                if result == 0 {
-                    self.appendLog("[iOS] Start accepted; waiting for transport")
-                    self.disconnectButton.isEnabled = true
-                    self.testButton.isEnabled = true
-                } else {
-                    self.finishStartFailure("OpenFlux start failed (code \(result))")
-                }
-            }
+        let kind = transportControl.selectedSegmentIndex == 0 ? "yandex" : "max"
+        let url = urlField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let token = tokenField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let uid = uidField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if kind == "yandex" && !url.hasPrefix("https://") {
+            showError("Нужна полная HTTPS-ссылка на документ Yandex")
+            return
         }
-    }
-
-    private func finishStartFailure(_ message: String) {
-        appendLog("[iOS] ERROR: \(message)")
-        statusLabel.text = "● \(message)"
-        connectButton.isEnabled = true
-        transportControl.isEnabled = true
-        urlField.isEnabled = true
-        maxTokenField.isEnabled = true
-        maxUIDField.isEnabled = true
-        disconnectButton.isEnabled = false
-        testButton.isEnabled = false
-    }
-
-    @objc private func disconnectTapped() {
-        disconnectButton.isEnabled = false
-        testButton.isEnabled = false
-        appendLog("[iOS] ===== DISCONNECT =====")
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = OFStop()
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.connectButton.isEnabled = true
-                self.transportControl.isEnabled = true
-                self.urlField.isEnabled = true
-                self.maxTokenField.isEnabled = true
-                self.maxUIDField.isEnabled = true
-                self.statusLabel.text = "● Stopped"
-            }
-        }
-    }
-
-    @objc private func testTapped() {
-        testButton.isEnabled = false
-        appendLog("[iOS] Running tunnel TCP test…")
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let ptr = OFTestTunnel() else { return }
-            let result = String(cString: ptr)
-            OFFreeString(ptr)
-
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.appendLog("[TEST] \(result)")
-                self.testButton.isEnabled = true
-
-                let alert = UIAlertController(
-                    title: result.hasPrefix("OK:") ? "Tunnel works" : "Tunnel test failed",
-                    message: result,
-                    preferredStyle: .alert
-                )
-                alert.addAction(UIAlertAction(title: "OK", style: .default))
-                self.present(alert, animated: true)
-            }
-        }
-    }
-
-    @objc private func clearLogTapped() {
-        logView.text = ""
-        appendLog("[iOS] log cleared")
-    }
-
-    private func startStatusTimer() {
-        statusTimer = Timer.scheduledTimer(
-            withTimeInterval: 1.0,
-            repeats: true
-        ) { [weak self] _ in
-            self?.refreshStatus()
-        }
-        refreshStatus()
-    }
-
-    private func refreshStatus() {
-        guard let ptr = OFStatusJSON() else { return }
-        let string = String(cString: ptr)
-        OFFreeString(ptr)
-
-        guard let data = string.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        if kind == "max" && (token.isEmpty || (Int64(uid) ?? 0) <= 0) {
+            showError("Укажите token и UID выходного узла MAX")
             return
         }
 
-        let running = obj["running"] as? Bool ?? false
-        let connected = obj["connected"] as? Bool ?? false
-        let socks = obj["socksListening"] as? Bool ?? false
-        let lastError = obj["lastError"] as? String ?? ""
-        let kind = obj["transport"] as? String ?? ""
+        let proto = NETunnelProviderProtocol()
+        proto.providerBundleIdentifier = tunnelBundleIdentifier
+        proto.serverAddress = "OpenFlux"
+        proto.providerConfiguration = [
+            "transport": kind,
+            "url": url,
+            "token": token,
+            "uid": uid
+        ]
+        manager.protocolConfiguration = proto
+        manager.localizedDescription = "whiteLIST"
+        manager.isEnabled = true
 
-        let sent = (obj["bytesSent"] as? NSNumber)?.uint64Value ?? 0
-        let received = (obj["bytesReceived"] as? NSNumber)?.uint64Value ?? 0
-        let ps = (obj["packetsSent"] as? NSNumber)?.uint64Value ?? 0
-        let pr = (obj["packetsRecv"] as? NSNumber)?.uint64Value ?? 0
-        let reconnects = (obj["reconnects"] as? NSNumber)?.uint64Value ?? 0
-        let uptime = (obj["uptimeMs"] as? NSNumber)?.int64Value ?? 0
-
-        if !lastError.isEmpty {
-            statusLabel.text = "● Error: \(lastError)"
-        } else if connected {
-            statusLabel.text = "● Transport connected (\(kind))"
-        } else if running {
-            statusLabel.text = "● Connecting (\(kind))…"
-        } else {
-            statusLabel.text = "● Stopped"
-        }
-
-        statsLabel.text = """
-        SOCKS5: \(socks ? "127.0.0.1:1080 listening" : "stopped")
-        ↑ \(formatBytes(sent)) / \(ps) packets
-        ↓ \(formatBytes(received)) / \(pr) packets
-        reconnects: \(reconnects)   uptime: \(formatDuration(uptime))
-        """
-
-        if running {
-            connectButton.isEnabled = false
-            disconnectButton.isEnabled = true
-            testButton.isEnabled = true
+        saveButton.isEnabled = false
+        manager.saveToPreferences { [weak self] error in
+            guard let self else { return }
+            if let error {
+                DispatchQueue.main.async {
+                    self.saveButton.isEnabled = true
+                    self.showError("Не удалось сохранить VPN: \(error.localizedDescription)")
+                }
+                return
+            }
+            manager.loadFromPreferences { error in
+                DispatchQueue.main.async {
+                    self.saveButton.isEnabled = true
+                    if let error {
+                        self.showError("Не удалось перечитать VPN: \(error.localizedDescription)")
+                        return
+                    }
+                    self.settingsStack.isHidden = true
+                    if self.connectAfterSave {
+                        self.connectAfterSave = false
+                        self.connectTapped()
+                    } else {
+                        self.detailLabel.text = "Настройка сохранена"
+                    }
+                }
+            }
         }
     }
 
-    private func formatBytes(_ value: UInt64) -> String {
+    @objc private func toggleSettings() {
+        settingsStack.isHidden.toggle()
+    }
+
+    @objc private func transportChanged() {
+        let yandex = transportControl.selectedSegmentIndex == 0
+        urlField.isHidden = !yandex
+        tokenField.isHidden = yandex
+        uidField.isHidden = yandex
+    }
+
+    @objc private func dismissKeyboard() {
+        view.endEditing(true)
+    }
+
+    private func refresh() {
+        guard let connection = manager?.connection else {
+            renderOSStatus(.invalid)
+            return
+        }
+        renderOSStatus(connection.status)
+        guard connection.status == .connected else {
+            latestStatus = nil
+            internetVerified = false
+            return
+        }
+        queryProviderStatus { [weak self] status in
+            guard let self, let status else { return }
+            self.latestStatus = status
+            self.renderOSStatus(connection.status)
+            if status.connected, !self.probeInFlight, Date().timeIntervalSince(self.lastProbe) >= 10 {
+                self.verifyInternet(before: status)
+            }
+        }
+    }
+
+    private func queryProviderStatus(completion: @escaping (TunnelStatus?) -> Void) {
+        guard let session = manager?.connection as? NETunnelProviderSession else {
+            completion(nil)
+            return
+        }
+        do {
+            try session.sendProviderMessage(Data("status".utf8)) { data in
+                let status = data.flatMap { try? JSONDecoder().decode(TunnelStatus.self, from: $0) }
+                DispatchQueue.main.async { completion(status) }
+            }
+        } catch {
+            completion(nil)
+        }
+    }
+
+    private func verifyInternet(before: TunnelStatus) {
+        probeInFlight = true
+        lastProbe = Date()
+        var request = URLRequest(url: URL(string: "https://1.1.1.1/cdn-cgi/trace?whiteLIST=\(Int(Date().timeIntervalSince1970))")!)
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.timeoutInterval = 8
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.waitsForConnectivity = false
+        URLSession(configuration: configuration).dataTask(with: request) { [weak self] _, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.queryProviderStatus { after in
+                    self.probeInFlight = false
+                    let httpOK = (response as? HTTPURLResponse).map { 200..<400 ~= $0.statusCode } ?? false
+                    let tunnelMoved = after.map {
+                        $0.bytesReceived > before.bytesReceived && $0.packetsRecv > before.packetsRecv
+                    } ?? false
+                    self.internetVerified = error == nil && httpOK && tunnelMoved
+                    if let after { self.latestStatus = after }
+                    self.renderOSStatus(self.manager?.connection.status ?? .invalid)
+                }
+            }
+        }.resume()
+    }
+
+    private func renderOSStatus(_ status: NEVPNStatus) {
+        connectButton.isEnabled = manager != nil && status != .disconnecting
+        switch status {
+        case .connected:
+            connectButton.setTitle("Отключить", for: .normal)
+            if let tunnel = latestStatus, !tunnel.lastError.isEmpty {
+                setStatus("Ошибка", detail: tunnel.lastError, color: .systemRed)
+            } else if latestStatus?.connected != true {
+                setStatus("Подключение…", detail: "Ожидание канала OpenFlux", color: .systemOrange)
+            } else if internetVerified {
+                setStatus("Работает", detail: "Интернет проверен через OpenFlux", color: .systemGreen)
+            } else {
+                setStatus("Проверка…", detail: "Канал поднят, проверяем реальный трафик", color: .systemOrange)
+            }
+        case .connecting, .reasserting:
+            connectButton.setTitle("Отключить", for: .normal)
+            setStatus("Подключение…", detail: "Запуск VPN и транспорта", color: .systemOrange)
+        case .disconnecting:
+            connectButton.setTitle("Отключение…", for: .normal)
+            setStatus("Отключение…", detail: "", color: .systemOrange)
+        case .disconnected:
+            connectButton.setTitle("Подключить", for: .normal)
+            setStatus("Отключено", detail: hasValidSavedConfiguration ? "Готово к подключению" : "Откройте настройку", color: .systemGray)
+        case .invalid:
+            connectButton.setTitle("Подключить", for: .normal)
+            setStatus("Не настроено", detail: "Сохраните параметры подключения", color: .systemGray)
+        @unknown default:
+            setStatus("Неизвестно", detail: "", color: .systemGray)
+        }
+
+        if let tunnel = latestStatus {
+            statsLabel.text = "↑ \(formatBytes(tunnel.bytesSent))   ↓ \(formatBytes(tunnel.bytesReceived))\nпакеты: \(tunnel.packetsSent) / \(tunnel.packetsRecv)   потери: \(tunnel.droppedRecv)"
+        } else {
+            statsLabel.text = "↑ 0 Б   ↓ 0 Б"
+        }
+    }
+
+    private func setStatus(_ title: String, detail: String, color: UIColor) {
+        statusLabel.text = title
+        detailLabel.text = detail
+        statusDot.backgroundColor = color
+    }
+
+    private func formatBytes(_ bytes: UInt64) -> String {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .binary
-        return formatter.string(fromByteCount: Int64(value))
+        return formatter.string(fromByteCount: Int64(bytes))
     }
 
-    private func formatDuration(_ ms: Int64) -> String {
-        let seconds = max(0, ms / 1000)
-        return String(format: "%02d:%02d:%02d", seconds / 3600, (seconds / 60) % 60, seconds % 60)
+    private func showError(_ message: String) {
+        let alert = UIAlertController(title: "whiteLIST", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
     }
+}
 
-    private func appendLog(_ text: String, timestamp: Bool = true) {
-        let rendered: String
-        if timestamp {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "HH:mm:ss"
-            rendered = "[\(formatter.string(from: Date()))] \(text)"
-        } else {
-            rendered = text
-        }
-
-        if logView.text.isEmpty {
-            logView.text = rendered
-        } else if logView.text.hasSuffix("\n") {
-            logView.text += rendered
-        } else {
-            logView.text += "\n" + rendered
-        }
-
-        if logView.text.utf16.count > 120_000 {
-            let idx = logView.text.index(logView.text.startIndex, offsetBy: min(40_000, logView.text.count))
-            logView.text = String(logView.text[idx...])
-        }
-
-        let length = logView.text.utf16.count
-        if length > 0 {
-            logView.scrollRangeToVisible(NSRange(location: length - 1, length: 1))
-        }
-    }
-
-    private func saveSettings() {
-        defaults.set(transportControl.selectedSegmentIndex, forKey: "transport")
-        defaults.set(urlField.text ?? "", forKey: "yandexURL")
-        defaults.set(maxTokenField.text ?? "", forKey: "maxToken")
-        defaults.set(maxUIDField.text ?? "", forKey: "maxUID")
-    }
-
-    private func loadSettings() {
-        let transport = defaults.integer(forKey: "transport")
-        transportControl.selectedSegmentIndex = (transport == 1 ? 1 : 0)
-        urlField.text = defaults.string(forKey: "yandexURL") ?? ""
-        maxTokenField.text = defaults.string(forKey: "maxToken") ?? ""
-        maxUIDField.text = defaults.string(forKey: "maxUID") ?? ""
+private extension UITextField {
+    func setLeftPadding(_ value: CGFloat) {
+        let spacer = UIView(frame: CGRect(x: 0, y: 0, width: value, height: 1))
+        leftView = spacer
+        leftViewMode = .always
     }
 }

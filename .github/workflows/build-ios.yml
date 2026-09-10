@@ -1,9 +1,11 @@
-name: Build OpenFlux iOS IPA
+name: Build whiteLIST iOS IPA
 
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
+      - codex/**
 
 permissions:
   contents: read
@@ -14,20 +16,8 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v7
-
-      - name: Verify OpenFlux sources
-        shell: bash
-        run: |
-          set -euxo pipefail
-          test -f go.mod
-          test -f go.sum
-          test -f main.go
-          test -f build_ios.sh
-          test -f ios_export.go
-          test -f ios/App.swift
-          test -f ios/Info.plist
 
       - name: Setup Go
         uses: actions/setup-go@v7
@@ -36,77 +26,90 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: Tool versions
-        run: |
-          go version
-          xcodebuild -version
-          swiftc --version
-          xcrun --sdk iphoneos --show-sdk-path
+      - name: Test Go core
+        run: go test ./...
 
-      - name: Build OpenFlux Go library
+      - name: Build OpenFlux library
         shell: bash
         run: |
           set -euxo pipefail
           chmod +x build_ios.sh
           ./build_ios.sh
           test -s output/ios/liboflux.a
-          test -s output/ios/liboflux.h
+          grep -q OFStartYandex output/ios/liboflux.h
+          grep -q OFStartMax output/ios/liboflux.h
+          grep -q OFSendPacket output/ios/liboflux.h
+          grep -q OFReceivePacket output/ios/liboflux.h
+          grep -q OFStatusJSON output/ios/liboflux.h
 
-      - name: Verify iOS bridge symbols
+      - name: Compile app and packet tunnel
         shell: bash
         run: |
           set -euxo pipefail
-          grep -q "OFStartYandex" output/ios/liboflux.h
-          grep -q "OFStartMax" output/ios/liboflux.h
-          grep -q "OFStop" output/ios/liboflux.h
-          grep -q "OFStatusJSON" output/ios/liboflux.h
-          grep -q "OFTestTunnel" output/ios/liboflux.h
-
-      - name: Compile unsigned iOS app
-        shell: bash
-        run: |
-          set -euxo pipefail
-
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          APP="$PWD/build/Payload/OpenFlux.app"
+          APP="$PWD/build/Payload/whiteLIST.app"
+          EXT="$APP/PlugIns/OpenFluxTunnel.appex"
 
           rm -rf "$PWD/build"
-          mkdir -p "$APP"
+          mkdir -p "$EXT"
           cp ios/Info.plist "$APP/Info.plist"
+          cp ios/Tunnel-Info.plist "$EXT/Info.plist"
 
           xcrun --sdk iphoneos swiftc \
-            -parse-as-library \
+            -O -parse-as-library \
             -sdk "$SDK" \
-            -target arm64-apple-ios18.0 \
-            -import-objc-header "$PWD/output/ios/liboflux.h" \
-            "$PWD/ios/App.swift" \
-            "$PWD/output/ios/liboflux.a" \
+            -target arm64-apple-ios15.0 \
+            -module-name whiteLIST \
+            ios/App.swift \
             -framework UIKit \
             -framework Foundation \
-            -framework Security \
+            -framework NetworkExtension \
+            -o "$APP/whiteLIST"
+
+          xcrun --sdk iphoneos swiftc \
+            -O -parse-as-library -application-extension \
+            -sdk "$SDK" \
+            -target arm64-apple-ios15.0 \
+            -module-name OpenFluxTunnel \
+            -import-objc-header "$PWD/output/ios/liboflux.h" \
+            ios/PacketTunnelProvider.swift \
+            "$PWD/output/ios/liboflux.a" \
+            -framework Foundation \
             -framework Network \
+            -framework NetworkExtension \
+            -framework Security \
+            -Xlinker -e -Xlinker _NSExtensionMain \
             -Xlinker -no_warn_duplicate_libraries \
-            -o "$APP/OpenFlux"
+            -o "$EXT/OpenFluxTunnel"
 
-          chmod +x "$APP/OpenFlux"
-          rm -rf "$APP/_CodeSignature" || true
-          rm -f "$APP/embedded.mobileprovision" || true
+          chmod +x "$APP/whiteLIST" "$EXT/OpenFluxTunnel"
+          file "$APP/whiteLIST" "$EXT/OpenFluxTunnel"
 
-          file "$APP/OpenFlux"
-          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
-
-      - name: Package unsigned IPA
+      - name: Embed entitlements and package IPA
         shell: bash
         run: |
           set -euxo pipefail
-          cd build
-          /usr/bin/zip -qry OpenFlux-unsigned.ipa Payload
-          shasum -a 256 OpenFlux-unsigned.ipa
+          APP="$PWD/build/Payload/whiteLIST.app"
+          EXT="$APP/PlugIns/OpenFluxTunnel.appex"
 
-      - name: Upload IPA artifact
+          codesign --force --sign - --entitlements ios/Tunnel.entitlements "$EXT"
+          codesign --force --sign - --entitlements ios/App.entitlements "$APP"
+          codesign --verify --deep --strict "$APP"
+
+          codesign -d --entitlements :- "$EXT" 2>&1 | grep -q packet-tunnel-provider
+          /usr/libexec/PlistBuddy -c "Print :NSExtension:NSExtensionPointIdentifier" "$EXT/Info.plist" \
+            | grep -q com.apple.networkextension.packet-tunnel
+
+          cd build
+          /usr/bin/zip -qry whiteLIST-unsigned.ipa Payload
+          shasum -a 256 whiteLIST-unsigned.ipa | tee whiteLIST-unsigned.ipa.sha256
+
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: OpenFlux-iOS
-          path: build/OpenFlux-unsigned.ipa
+          name: whiteLIST-iOS
+          path: |
+            build/whiteLIST-unsigned.ipa
+            build/whiteLIST-unsigned.ipa.sha256
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30

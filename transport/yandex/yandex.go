@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
+	neturl "net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -49,8 +51,8 @@ func (s *DocSession) safeWrite(messageType int, data []byte) error {
 type YandexDocsTransport struct {
 	*transport.BaseTransport
 
-	url      string
-	session  *DocSession
+	url     string
+	session *DocSession
 
 	userCounter atomic.Int32
 	baseUserID  string
@@ -74,6 +76,20 @@ func (t *YandexDocsTransport) Start() error {
 	go t.keepAliveLoop()
 	t.connectToDoc(0)
 
+	return nil
+}
+
+func (t *YandexDocsTransport) Stop() error {
+	if err := t.BaseTransport.Stop(); err != nil {
+		return err
+	}
+	t.Mu.Lock()
+	session := t.session
+	t.session = nil
+	t.Mu.Unlock()
+	if session != nil && session.Conn != nil {
+		_ = session.Conn.Close()
+	}
 	return nil
 }
 
@@ -295,7 +311,13 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	}
 
 	t.RecordReconnect()
-	t.connectToDoc(attempt + 1)
+	delay := float64(t.GetConfig().ReconnectDelay) * math.Pow(t.GetConfig().ReconnectMultiplier, float64(attempt))
+	if delay > float64(15*time.Second) {
+		delay = float64(15 * time.Second)
+	}
+	time.AfterFunc(time.Duration(delay), func() {
+		t.connectToDoc(attempt + 1)
+	})
 }
 
 func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
@@ -304,15 +326,24 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		Timeout:       30 * time.Second,
 	}
 
-	req, _ := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return YandexDocsInfo{}, fmt.Errorf("invalid document URL: %w", err)
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := client.Do(req)
 	if err != nil {
 		return YandexDocsInfo{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return YandexDocsInfo{}, fmt.Errorf("document returned HTTP %d", resp.StatusCode)
+	}
 
-	htmlBytes, _ := io.ReadAll(resp.Body)
+	htmlBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return YandexDocsInfo{}, fmt.Errorf("read document: %w", err)
+	}
 	html := string(htmlBytes)
 
 	var cookies []string
@@ -327,17 +358,43 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	}
 
 	var config map[string]interface{}
-	json.Unmarshal([]byte(matches[1]), &config)
-	officeAction := config["officeActionData"].(map[string]interface{})
+	if err := json.Unmarshal([]byte(matches[1]), &config); err != nil {
+		return YandexDocsInfo{}, fmt.Errorf("invalid client config: %w", err)
+	}
+	officeAction, ok := config["officeActionData"].(map[string]interface{})
+	if !ok {
+		return YandexDocsInfo{}, fmt.Errorf("officeActionData missing")
+	}
 
 	editorConfigRaw, ok := officeAction["editor_config"].(map[string]interface{})
 	if !ok || editorConfigRaw == nil {
-		return YandexDocsInfo{}, fmt.Errorf("editor_config nil - will reconnect")
+		return YandexDocsInfo{}, fmt.Errorf("editor_config missing")
 	}
 
-	balancerURL := officeAction["balancer_url"].(string)
-	host := strings.TrimPrefix(balancerURL, "https://")
-	document := editorConfigRaw["document"].(map[string]interface{})
+	balancerURL, ok := officeAction["balancer_url"].(string)
+	if !ok || balancerURL == "" {
+		return YandexDocsInfo{}, fmt.Errorf("balancer_url missing")
+	}
+	parsedBalancer, err := neturl.Parse(balancerURL)
+	if err != nil || parsedBalancer.Host == "" {
+		return YandexDocsInfo{}, fmt.Errorf("invalid balancer_url")
+	}
+	host := parsedBalancer.Host
+	document, ok := editorConfigRaw["document"].(map[string]interface{})
+	if !ok {
+		return YandexDocsInfo{}, fmt.Errorf("document config missing")
+	}
+	docID, ok := document["key"].(string)
+	if !ok || docID == "" {
+		return YandexDocsInfo{}, fmt.Errorf("document key missing")
+	}
+	token, ok := editorConfigRaw["token"].(string)
+	if !ok || token == "" {
+		return YandexDocsInfo{}, fmt.Errorf("document token missing")
+	}
+	fileType, _ := document["fileType"].(string)
+	documentURL, _ := document["url"].(string)
+	title, _ := document["title"].(string)
 
 	perms, _ := document["permissions"].(map[string]interface{})
 	if perms == nil {
@@ -346,19 +403,19 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 	return YandexDocsInfo{
 		CookieStr:   strings.Join(cookies, "; "),
-		Token:       editorConfigRaw["token"].(string),
-		DocID:       document["key"].(string),
+		Token:       token,
+		DocID:       docID,
 		Origin:      balancerURL,
 		Host:        host,
-		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, document["key"].(string)),
+		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, docID),
 		Permissions: perms,
 		OpenCmd: map[string]interface{}{
 			"c":      "open",
-			"id":     document["key"].(string),
+			"id":     docID,
 			"userid": userID,
-			"format": document["fileType"],
-			"url":    document["url"],
-			"title":  document["title"],
+			"format": fileType,
+			"url":    documentURL,
+			"title":  title,
 			"lcid":   25,
 		},
 	}, nil
