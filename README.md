@@ -1,4 +1,4 @@
-# OpenFlux - Universal Bypass Tool
+# OpenFlux
 
 **English** | [Русский](README.ru.md)
 
@@ -99,6 +99,13 @@ Then set up SOCKS5 proxy in your browser at localhost:1080.
 You are free to implement the `Transport` interface from `transport/transport.go` and register your custom transport in main.go switch block.
 
 ## License
+
+This project is licensed under the **GNU General Public License v3.0 or later**.
+See [LICENSE](LICENSE) for the full text.
+
+Third-party licenses are listed in [NOTICE](NOTICE).
+
+## Disclaimer
 
 Educational use only. Test on your own machines and networks.
 
